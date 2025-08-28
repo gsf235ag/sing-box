@@ -52,20 +52,11 @@
 
 ### 安装步骤
 
-1. **下载脚本**
+1. **脚本**
 ```bash
-wget -O singbox_manager.sh https://raw.githubusercontent.com/your-repo/singbox_manager.sh
+wget -N https://raw.githubusercontent.com/gsf235ag/sing-box/master/singbox_manager.sh && bash singbox_manager.sh
 ```
 
-2. **添加执行权限**
-```bash
-chmod +x singbox_manager.sh
-```
-
-3. **运行脚本**
-```bash
-sudo ./singbox_manager.sh
-```
 
 ## 📋 使用说明
 
@@ -213,14 +204,12 @@ systemctl restart sing-box
 
 欢迎提交 Issue 和 Pull Request 来改进这个项目。
 
-## 📄 许可证
-
-本项目采用 MIT 许可证，详见 [LICENSE](LICENSE) 文件。
 
 ## ⚠️ 免责声明
 
 本脚本仅供学习和研究使用，请遵守当地法律法规。使用者需自行承担使用风险。
 
 ---
+
 
 **注意**：使用前请确保您了解相关协议的工作原理和安全风险。 
