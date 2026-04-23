@@ -186,6 +186,15 @@ validate_port() {
     return 0
 }
 
+# 检查端口是否已在当前配置中被使用
+is_port_used_in_config() {
+    local port=$1
+    if [[ ! -f "$CONFIG_FILE" ]] || ! command -v jq &> /dev/null; then
+        return 1
+    fi
+    jq -e --argjson port "$port" '.inbounds[]? | select(.listen_port == $port)' "$CONFIG_FILE" > /dev/null 2>&1
+}
+
 # 获取自定义端口
 get_custom_port() {
     local default_port=$1
@@ -198,8 +207,12 @@ get_custom_port() {
         fi
         
         if validate_port "$port"; then
-            echo "$port"
-            break
+            if is_port_used_in_config "$port"; then
+                echo -e "${YELLOW}警告: 端口 ${port} 已被已安装协议使用，请更换端口${NC}"
+            else
+                echo "$port"
+                break
+            fi
         fi
     done
 }
@@ -228,9 +241,75 @@ EOF
     systemctl daemon-reload
 }
 
+# 使配置生效
+apply_service_changes() {
+    create_systemd_service
+    systemctl enable sing-box
+    if systemctl is-active --quiet sing-box; then
+        systemctl restart sing-box
+    else
+        systemctl start sing-box
+    fi
+}
+
 # 创建配置目录
 create_config_dir() {
     mkdir -p "$SING_BOX_DIR"
+}
+
+# 初始化配置文件（多协议共存）
+init_config_file() {
+    create_config_dir
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        cat > "$CONFIG_FILE" << EOF
+{
+  "log": {
+    "level": "info",
+    "output": "$LOG_FILE"
+  },
+  "inbounds": []
+}
+EOF
+        return
+    fi
+
+    if ! jq empty "$CONFIG_FILE" > /dev/null 2>&1; then
+        cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%s)"
+        cat > "$CONFIG_FILE" << EOF
+{
+  "log": {
+    "level": "info",
+    "output": "$LOG_FILE"
+  },
+  "inbounds": []
+}
+EOF
+        echo -e "${YELLOW}警告: 原配置文件不是有效JSON，已备份并重新初始化${NC}"
+    fi
+}
+
+# 合并入站配置（按tag覆盖，支持多协议共存）
+upsert_inbound() {
+    local inbound_json=$1
+    local tmp_file
+
+    init_config_file
+    tmp_file=$(mktemp)
+
+    jq --arg log_file "$LOG_FILE" --argjson inbound "$inbound_json" '
+      .log = (.log // {"level":"info","output":$log_file}) |
+      .inbounds = (((.inbounds // []) | map(select(.tag != $inbound.tag))) + [$inbound])
+    ' "$CONFIG_FILE" > "$tmp_file"
+
+    mv "$tmp_file" "$CONFIG_FILE"
+}
+
+# 生成自签名证书（ECDSA）
+generate_self_signed_cert() {
+    create_config_dir
+    openssl ecparam -name prime256v1 -genkey -noout -out "$SING_BOX_DIR/key.pem"
+    openssl req -new -x509 -key "$SING_BOX_DIR/key.pem" -out "$SING_BOX_DIR/cert.pem" -days 3650 \
+        -subj "/C=US/ST=State/L=City/O=Organization/OU=Organizational Unit/CN=sing-box.local"
 }
 
 # VLESS Reality配置
@@ -247,53 +326,43 @@ install_vless_reality() {
     public_key=$(echo $keys | awk '{print $2}')
     server_ip=$(get_server_ip)
     
+    create_config_dir
+    
     # 保存密钥对到文件
     echo "PrivateKey: $private_key" > "$SING_BOX_DIR/reality_keys.txt"
     echo "PublicKey: $public_key" >> "$SING_BOX_DIR/reality_keys.txt"
-    
-    create_config_dir
-    
-    cat > "$CONFIG_FILE" << EOF
+    inbound_json=$(cat << EOF
 {
-  "log": {
-    "level": "info",
-    "output": "$LOG_FILE"
-  },
-  "inbounds": [
+  "type": "vless",
+  "tag": "vless-in",
+  "listen": "::",
+  "listen_port": $port,
+  "users": [
     {
-      "type": "vless",
-      "tag": "vless-in",
-      "listen": "::",
-      "listen_port": $port,
-      "users": [
-        {
-          "uuid": "$uuid",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "itunes.apple.com",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "itunes.apple.com",
-            "server_port": 443
-          },
-          "private_key": "$private_key",
-          "short_id": [
-            "$short_id"
-          ]
-        }
-      }
+      "uuid": "$uuid",
+      "flow": "xtls-rprx-vision"
     }
-  ]
+  ],
+  "tls": {
+    "enabled": true,
+    "server_name": "itunes.apple.com",
+    "reality": {
+      "enabled": true,
+      "handshake": {
+        "server": "itunes.apple.com",
+        "server_port": 443
+      },
+      "private_key": "$private_key",
+      "short_id": [
+        "$short_id"
+      ]
+    }
+  }
 }
 EOF
-
-    create_systemd_service
-    systemctl enable sing-box
-    systemctl start sing-box
+)
+    upsert_inbound "$inbound_json"
+    apply_service_changes
     
     echo -e "${GREEN}VLESS Reality安装完成！${NC}"
     echo -e "${YELLOW}客户端配置:${NC}"
@@ -334,46 +403,35 @@ install_hysteria2() {
             fi
             
             password=$(generate_password)
-            
-            create_config_dir
-            
-            cat > "$CONFIG_FILE" << EOF
+            inbound_json=$(cat << EOF
 {
-  "log": {
-    "level": "info",
-    "output": "$LOG_FILE"
-  },
-  "inbounds": [
+  "type": "hysteria2",
+  "tag": "hy2-in",
+  "listen": "::",
+  "listen_port": $port,
+  "users": [
     {
-      "type": "hysteria2",
-      "tag": "hy2-in",
-      "listen": "::",
-      "listen_port": $port,
-      "users": [
-        {
-          "password": "$password"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "alpn": [
-          "h3"
-        ],
-        "server_name": "$domain",
-        "acme": {
-          "domain": "$domain",
-          "data_directory": "/etc/sing-box/acme",
-          "default_server_name": "$domain"
-        }
-      }
+      "name": "hy2-user",
+      "password": "$password"
     }
-  ]
+  ],
+  "tls": {
+    "enabled": true,
+    "alpn": [
+      "h3"
+    ],
+    "server_name": "$domain",
+    "acme": {
+      "domain": "$domain",
+      "data_directory": "/etc/sing-box/acme",
+      "default_server_name": "$domain"
+    }
+  }
 }
 EOF
-
-            create_systemd_service
-            systemctl enable sing-box
-            systemctl start sing-box
+)
+            upsert_inbound "$inbound_json"
+            apply_service_changes
             
             echo -e "${GREEN}Hysteria2安装完成！${NC}"
             echo -e "${YELLOW}客户端配置:${NC}"
@@ -383,47 +441,32 @@ EOF
             # 自签名证书
             password=$(generate_password)
             server_ip=$(get_server_ip)
-            
-            create_config_dir
-            
-            cat > "$CONFIG_FILE" << EOF
+            generate_self_signed_cert
+            inbound_json=$(cat << EOF
 {
-  "log": {
-    "level": "info",
-    "output": "$LOG_FILE"
-  },
-  "inbounds": [
+  "type": "hysteria2",
+  "tag": "hy2-in",
+  "listen": "::",
+  "listen_port": $port,
+  "users": [
     {
-      "type": "hysteria2",
-      "tag": "hy2-in",
-      "listen": "::",
-      "listen_port": $port,
-      "users": [
-        {
-          "password": "$password"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "alpn": [
-          "h3"
-        ],
-        "certificate_path": "/etc/sing-box/cert.pem",
-        "key_path": "/etc/sing-box/key.pem"
-      }
+      "name": "hy2-user",
+      "password": "$password"
     }
-  ]
+  ],
+  "tls": {
+    "enabled": true,
+    "alpn": [
+      "h3"
+    ],
+    "certificate_path": "/etc/sing-box/cert.pem",
+    "key_path": "/etc/sing-box/key.pem"
+  }
 }
 EOF
-
-            # 生成自签名证书
-            openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
-                -keyout "$SING_BOX_DIR/key.pem" -out "$SING_BOX_DIR/cert.pem" -days 3650 \
-                -subj "/C=US/ST=State/L=City/O=Organization/OU=Organizational Unit/CN=hy2.example.com"
-
-            create_systemd_service
-            systemctl enable sing-box
-            systemctl start sing-box
+)
+            upsert_inbound "$inbound_json"
+            apply_service_changes
             
             echo -e "${GREEN}Hysteria2安装完成！${NC}"
             echo -e "${YELLOW}客户端配置:${NC}"
@@ -436,224 +479,162 @@ EOF
     esac
 }
 
-# 混合模式配置
-install_mixed_protocols() {
-    echo -e "${BLUE}正在安装混合协议模式...${NC}"
-    
-    # 获取自定义端口
-    vless_port=$(get_custom_port 443 "VLESS Reality")
-    hy2_port=$(get_custom_port 8443 "Hysteria2")
-    
-    # 选择Hysteria2证书类型
-    echo -e "${CYAN}请选择Hysteria2证书类型:${NC}"
+# SOCKS5配置
+install_socks5() {
+    echo -e "${BLUE}正在安装SOCKS5...${NC}"
+
+    port=$(get_custom_port 1080 "SOCKS5")
+    read -p "请输入SOCKS5用户名 (默认: admin): " username
+    read -p "请输入SOCKS5密码 (留空自动生成): " password
+    username=${username:-admin}
+    password=${password:-$(generate_password)}
+    server_ip=$(get_server_ip)
+
+    inbound_json=$(cat << EOF
+{
+  "type": "socks",
+  "tag": "socks-in",
+  "listen": "::",
+  "listen_port": $port,
+  "users": [
+    {
+      "username": "$username",
+      "password": "$password"
+    }
+  ]
+}
+EOF
+)
+    upsert_inbound "$inbound_json"
+    apply_service_changes
+
+    echo -e "${GREEN}SOCKS5安装完成！${NC}"
+    echo -e "${YELLOW}客户端配置:${NC}"
+    echo "socks5://$username:$password@$server_ip:$port"
+}
+
+# Shadowsocks配置
+install_shadowsocks() {
+    echo -e "${BLUE}正在安装Shadowsocks...${NC}"
+
+    port=$(get_custom_port 8388 "Shadowsocks")
+    read -p "请输入加密方法 (默认: aes-128-gcm): " method
+    read -p "请输入Shadowsocks密码 (留空自动生成): " password
+    method=${method:-aes-128-gcm}
+    password=${password:-$(generate_password)}
+    server_ip=$(get_server_ip)
+
+    inbound_json=$(cat << EOF
+{
+  "type": "shadowsocks",
+  "tag": "ss-in",
+  "listen": "::",
+  "listen_port": $port,
+  "method": "$method",
+  "password": "$password"
+}
+EOF
+)
+    upsert_inbound "$inbound_json"
+    apply_service_changes
+
+    ss_credential=$(printf "%s" "${method}:${password}" | base64 | tr -d '\n')
+    echo -e "${GREEN}Shadowsocks安装完成！${NC}"
+    echo -e "${YELLOW}客户端配置:${NC}"
+    echo "ss://$ss_credential@$server_ip:$port#Shadowsocks"
+}
+
+# AnyTLS配置
+install_anytls() {
+    echo -e "${BLUE}正在安装AnyTLS...${NC}"
+
+    port=$(get_custom_port 16999 "AnyTLS")
+    read -p "请输入AnyTLS用户名 (默认: anytls-user): " username
+    read -p "请输入AnyTLS密码 (留空自动生成): " password
+    username=${username:-anytls-user}
+    password=${password:-$(generate_password)}
+    server_ip=$(get_server_ip)
+
+    echo -e "${CYAN}请选择证书类型:${NC}"
     echo -e "${GREEN}1.${NC} Let's Encrypt 自动证书 (推荐，需要域名)"
     echo -e "${GREEN}2.${NC} 自签名证书 (无需域名)"
     read -p "请选择 [1-2]: " cert_choice
-    
+
     case $cert_choice in
         1)
-            # Let's Encrypt 证书
             read -p "请输入您的域名 (例如: example.com): " domain
             if [[ -z "$domain" ]]; then
                 echo -e "${RED}错误: 域名不能为空${NC}"
                 return 1
             fi
-            
-            # 验证域名解析
+
             echo -e "${BLUE}正在验证域名解析...${NC}"
-            server_ip=$(get_server_ip)
-            
             if ! verify_domain_resolution "$domain" "$server_ip"; then
                 read -p "是否继续? (y/n): " continue_choice
                 if [[ $continue_choice != "y" && $continue_choice != "Y" ]]; then
                     return 1
                 fi
             fi
-            
-            # VLESS Reality
-            vless_uuid=$(generate_uuid)
-            vless_short_id=$(openssl rand -hex 8)
-            keys=$(generate_reality_keys)
-            private_key=$(echo $keys | awk '{print $1}')
-            public_key=$(echo $keys | awk '{print $2}')
-            
-            # Hysteria2
-            hy2_password=$(generate_password)
-            
-            create_config_dir
-            
-            # 保存密钥对到文件
-            echo "PrivateKey: $private_key" > "$SING_BOX_DIR/reality_keys.txt"
-            echo "PublicKey: $public_key" >> "$SING_BOX_DIR/reality_keys.txt"
-            
-            cat > "$CONFIG_FILE" << EOF
+
+            inbound_json=$(cat << EOF
 {
-  "log": {
-    "level": "info",
-    "output": "$LOG_FILE"
-  },
-  "inbounds": [
+  "type": "anytls",
+  "tag": "anytls-in",
+  "listen": "::",
+  "listen_port": $port,
+  "users": [
     {
-      "type": "vless",
-      "tag": "vless-in",
-      "listen": "::",
-      "listen_port": $vless_port,
-      "users": [
-        {
-          "uuid": "$vless_uuid",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "itunes.apple.com",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "itunes.apple.com",
-            "server_port": 443
-          },
-          "private_key": "$private_key",
-          "short_id": [
-            "$vless_short_id"
-          ]
-        }
-      }
-    },
-    {
-      "type": "hysteria2",
-      "tag": "hy2-in",
-      "listen": "::",
-      "listen_port": $hy2_port,
-      "users": [
-        {
-          "password": "$hy2_password"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "alpn": [
-          "h3"
-        ],
-        "server_name": "$domain",
-        "acme": {
-          "domain": "$domain",
-          "data_directory": "/etc/sing-box/acme",
-          "default_server_name": "$domain"
-        }
-      }
+      "name": "$username",
+      "password": "$password"
     }
-  ]
+  ],
+  "tls": {
+    "enabled": true,
+    "server_name": "$domain",
+    "acme": {
+      "domain": "$domain",
+      "data_directory": "/etc/sing-box/acme",
+      "default_server_name": "$domain"
+    }
+  }
 }
 EOF
+)
+            upsert_inbound "$inbound_json"
+            apply_service_changes
 
-            create_systemd_service
-            systemctl enable sing-box
-            systemctl start sing-box
-            
-            echo -e "${GREEN}混合协议模式安装完成！${NC}"
+            echo -e "${GREEN}AnyTLS安装完成！${NC}"
             echo -e "${YELLOW}客户端配置:${NC}"
-            echo
-            echo "VLESS Reality:"
-            echo "vless://$vless_uuid@$server_ip:$vless_port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=itunes.apple.com&fp=chrome&pbk=$public_key&sid=$vless_short_id&type=tcp&headerType=none#VLESS-Reality"
-            echo
-            echo "Hysteria2:"
-            echo "hy2://$hy2_password@$domain:$hy2_port#Hysteria2"
+            echo "anytls://$username:$password@$domain:$port#AnyTLS"
             ;;
         2)
-            # 自签名证书
-            server_ip=$(get_server_ip)
-            
-            # VLESS Reality
-            vless_uuid=$(generate_uuid)
-            vless_short_id=$(openssl rand -hex 8)
-            keys=$(generate_reality_keys)
-            private_key=$(echo $keys | awk '{print $1}')
-            public_key=$(echo $keys | awk '{print $2}')
-            
-            # Hysteria2
-            hy2_password=$(generate_password)
-            
-            create_config_dir
-            
-            # 保存密钥对到文件
-            echo "PrivateKey: $private_key" > "$SING_BOX_DIR/reality_keys.txt"
-            echo "PublicKey: $public_key" >> "$SING_BOX_DIR/reality_keys.txt"
-            
-            cat > "$CONFIG_FILE" << EOF
+            generate_self_signed_cert
+            inbound_json=$(cat << EOF
 {
-  "log": {
-    "level": "info",
-    "output": "$LOG_FILE"
-    },
-  "inbounds": [
+  "type": "anytls",
+  "tag": "anytls-in",
+  "listen": "::",
+  "listen_port": $port,
+  "users": [
     {
-      "type": "vless",
-      "tag": "vless-in",
-      "listen": "::",
-      "listen_port": $vless_port,
-      "users": [
-        {
-          "uuid": "$vless_uuid",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "itunes.apple.com",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "itunes.apple.com",
-            "server_port": 443
-          },
-          "private_key": "$private_key",
-          "short_id": [
-            "$vless_short_id"
-          ]
-        }
-      }
-    },
-    {
-      "type": "hysteria2",
-      "tag": "hy2-in",
-      "listen": "::",
-      "listen_port": $hy2_port,
-      "users": [
-        {
-          "password": "$hy2_password"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "alpn": [
-          "h3"
-        ],
-        "certificate_path": "/etc/sing-box/cert.pem",
-        "key_path": "/etc/sing-box/key.pem"
-      }
+      "name": "$username",
+      "password": "$password"
     }
-  ]
+  ],
+  "tls": {
+    "enabled": true,
+    "certificate_path": "/etc/sing-box/cert.pem",
+    "key_path": "/etc/sing-box/key.pem"
+  }
 }
 EOF
+)
+            upsert_inbound "$inbound_json"
+            apply_service_changes
 
-            # 生成自签名证书
-            openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
-                -keyout "$SING_BOX_DIR/key.pem" -out "$SING_BOX_DIR/cert.pem" -days 3650 \
-                -subj "/C=US/ST=State/L=City/O=Organization/OU=Organizational Unit/CN=hy2.example.com"
-
-            create_systemd_service
-            systemctl enable sing-box
-            systemctl start sing-box
-            
-            echo -e "${GREEN}混合协议模式安装完成！${NC}"
+            echo -e "${GREEN}AnyTLS安装完成！${NC}"
             echo -e "${YELLOW}客户端配置:${NC}"
-            echo
-            echo "VLESS Reality:"
-            echo "vless://$vless_uuid@$server_ip:$vless_port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=itunes.apple.com&fp=chrome&pbk=$public_key&sid=$vless_short_id&type=tcp&headerType=none#VLESS-Reality"
-            echo
-            echo "Hysteria2:"
-            echo "hy2://$hy2_password@$server_ip:$hy2_port/?insecure=1#Hysteria2"
+            echo "anytls://$username:$password@$server_ip:$port?insecure=1#AnyTLS"
             ;;
         *)
             echo -e "${RED}无效选择${NC}"
@@ -664,57 +645,373 @@ EOF
 
 # 查看配置
 show_config() {
+    if ! command -v jq &> /dev/null; then
+        echo -e "${RED}缺少依赖: jq，请先执行任意“搭建协议”完成依赖安装${NC}"
+        return
+    fi
     if [[ ! -f "$CONFIG_FILE" ]]; then
         echo -e "${RED}未找到配置文件${NC}"
         return
     fi
+    if ! jq empty "$CONFIG_FILE" > /dev/null 2>&1; then
+        echo -e "${RED}配置文件JSON格式无效，请先修复: $CONFIG_FILE${NC}"
+        return
+    fi
     
     echo -e "${BLUE}当前配置信息:${NC}"
+    local server_ip found public_key
     server_ip=$(get_server_ip)
-    
-    # 检查配置文件中的协议类型
-    if grep -q '"type": "vless"' "$CONFIG_FILE"; then
-        echo -e "${GREEN}检测到VLESS Reality协议${NC}"
-        uuid=$(jq -r '.inbounds[] | select(.type=="vless") | .users[0].uuid' "$CONFIG_FILE")
-        port=$(jq -r '.inbounds[] | select(.type=="vless") | .listen_port' "$CONFIG_FILE")
-        short_id=$(jq -r '.inbounds[] | select(.type=="vless") | .tls.reality.short_id[0]' "$CONFIG_FILE")
-        
-        # 尝试从reality_keys.txt文件获取公钥
-        if [[ -f "$SING_BOX_DIR/reality_keys.txt" ]]; then
-            public_key=$(cat "$SING_BOX_DIR/reality_keys.txt" | cut -d' ' -f2)
-        else
-            # 如果没有reality_keys.txt文件，尝试从sing-box生成
-            echo -e "${YELLOW}正在生成Reality密钥对...${NC}"
-            key_pair=$("$BINARY_PATH" generate reality-keypair 2>/dev/null)
-            if [[ $? -eq 0 ]]; then
-                public_key=$(echo "$key_pair" | grep "PublicKey:" | awk '{print $2}')
-                # 保存密钥对到文件
-                echo "$key_pair" > "$SING_BOX_DIR/reality_keys.txt"
+    found=0
+
+    if [[ -f "$SING_BOX_DIR/reality_keys.txt" ]]; then
+        public_key=$(grep '^PublicKey:' "$SING_BOX_DIR/reality_keys.txt" | awk '{print $2}')
+    else
+        public_key=""
+    fi
+
+    while IFS= read -r inbound_b64; do
+        local inbound_json type port
+        inbound_json=$(echo "$inbound_b64" | base64 -d)
+        type=$(echo "$inbound_json" | jq -r '.type')
+        port=$(echo "$inbound_json" | jq -r '.listen_port // "N/A"')
+        found=1
+
+        case "$type" in
+            vless)
+                local uuid short_id
+                uuid=$(echo "$inbound_json" | jq -r '.users[0].uuid // ""')
+                short_id=$(echo "$inbound_json" | jq -r '.tls.reality.short_id[0] // ""')
+                echo -e "${GREEN}检测到VLESS Reality协议${NC}"
+                if [[ -n "$public_key" && -n "$short_id" && -n "$uuid" ]]; then
+                    echo "vless://$uuid@$server_ip:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=itunes.apple.com&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp&headerType=none#VLESS-Reality"
+                else
+                    echo -e "${YELLOW}VLESS Reality公钥或short_id缺失，请检查 $SING_BOX_DIR/reality_keys.txt${NC}"
+                fi
+                ;;
+            hysteria2)
+                local password domain
+                password=$(echo "$inbound_json" | jq -r '.users[0].password // ""')
+                domain=$(echo "$inbound_json" | jq -r '.tls.server_name // ""')
+                echo -e "${GREEN}检测到Hysteria2协议${NC}"
+                if [[ -n "$domain" ]]; then
+                    echo "hy2://$password@$domain:$port#Hysteria2"
+                else
+                    echo "hy2://$password@$server_ip:$port/?insecure=1#Hysteria2"
+                fi
+                ;;
+            socks)
+                local username password
+                username=$(echo "$inbound_json" | jq -r '.users[0].username // ""')
+                password=$(echo "$inbound_json" | jq -r '.users[0].password // ""')
+                echo -e "${GREEN}检测到SOCKS5协议${NC}"
+                echo "socks5://$username:$password@$server_ip:$port"
+                ;;
+            shadowsocks)
+                local method password ss_credential
+                method=$(echo "$inbound_json" | jq -r '.method // ""')
+                password=$(echo "$inbound_json" | jq -r '.password // ""')
+                echo -e "${GREEN}检测到Shadowsocks协议${NC}"
+                ss_credential=$(printf "%s" "${method}:${password}" | base64 | tr -d '\n')
+                echo "ss://$ss_credential@$server_ip:$port#Shadowsocks"
+                ;;
+            anytls)
+                local username password domain
+                username=$(echo "$inbound_json" | jq -r '.users[0].name // ""')
+                password=$(echo "$inbound_json" | jq -r '.users[0].password // ""')
+                domain=$(echo "$inbound_json" | jq -r '.tls.server_name // ""')
+                echo -e "${GREEN}检测到AnyTLS协议${NC}"
+                if [[ -n "$domain" ]]; then
+                    echo "anytls://$username:$password@$domain:$port#AnyTLS"
+                else
+                    echo "anytls://$username:$password@$server_ip:$port?insecure=1#AnyTLS"
+                fi
+                ;;
+        esac
+        echo
+    done < <(jq -r '.inbounds[]? | @base64' "$CONFIG_FILE")
+
+    if [[ $found -eq 0 ]]; then
+        echo -e "${YELLOW}当前未安装任何协议${NC}"
+    fi
+}
+
+# 协议显示名称
+get_protocol_display_name() {
+    local type=$1
+    local reality_enabled=$2
+
+    case "$type" in
+        "vless")
+            if [[ "$reality_enabled" == "true" ]]; then
+                echo "VLESS-REALITY"
             else
-                echo -e "${RED}无法生成Reality密钥对，请手动配置${NC}"
-                return 1
+                echo "VLESS"
             fi
-        fi
-        
-        if [[ -n "$public_key" && -n "$short_id" ]]; then
-            echo "vless://$uuid@$server_ip:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=itunes.apple.com&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp&headerType=none#VLESS-Reality"
-        else
-            echo -e "${RED}VLESS Reality配置信息不完整${NC}"
-        fi
+            ;;
+        "hysteria2")
+            echo "Hysteria2"
+            ;;
+        "shadowsocks")
+            echo "Shadowsocks"
+            ;;
+        "socks")
+            echo "SOCKS5"
+            ;;
+        "anytls")
+            echo "AnyTLS"
+            ;;
+        *)
+            echo "$type" | tr '[:lower:]' '[:upper:]'
+            ;;
+    esac
+}
+
+# 通过tag获取分享链接
+get_share_link_by_tag() {
+    local tag=$1
+    local inbound_json type server_ip
+    inbound_json=$(jq -c --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" 2>/dev/null)
+    if [[ -z "$inbound_json" ]]; then
+        return 1
     fi
-    
-    if grep -q '"type": "hysteria2"' "$CONFIG_FILE"; then
-        echo -e "${GREEN}检测到Hysteria2协议${NC}"
-        password=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .users[0].password' "$CONFIG_FILE")
-        port=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .listen_port' "$CONFIG_FILE")
-        domain=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .tls.server_name' "$CONFIG_FILE" 2>/dev/null)
-        
-        if [[ -n "$domain" && "$domain" != "null" ]]; then
-            echo "hy2://$password@$domain:$port#Hysteria2"
-        else
-            echo "hy2://$password@$server_ip:$port/?insecure=1#Hysteria2"
-        fi
+
+    type=$(echo "$inbound_json" | jq -r '.type // ""')
+    server_ip=$(get_server_ip)
+
+    case "$type" in
+        "vless")
+            local uuid short_id public_key
+            uuid=$(echo "$inbound_json" | jq -r '.users[0].uuid // ""')
+            short_id=$(echo "$inbound_json" | jq -r '.tls.reality.short_id[0] // ""')
+            if [[ -f "$SING_BOX_DIR/reality_keys.txt" ]]; then
+                public_key=$(grep '^PublicKey:' "$SING_BOX_DIR/reality_keys.txt" | awk '{print $2}')
+            fi
+            if [[ -n "$uuid" && -n "$short_id" && -n "$public_key" ]]; then
+                local port
+                port=$(echo "$inbound_json" | jq -r '.listen_port // "443"')
+                echo "vless://$uuid@$server_ip:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=itunes.apple.com&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp&headerType=none#VLESS-Reality"
+                return 0
+            fi
+            ;;
+        "hysteria2")
+            local hy2_password hy2_domain hy2_port
+            hy2_password=$(echo "$inbound_json" | jq -r '.users[0].password // ""')
+            hy2_domain=$(echo "$inbound_json" | jq -r '.tls.server_name // ""')
+            hy2_port=$(echo "$inbound_json" | jq -r '.listen_port // "8443"')
+            if [[ -n "$hy2_domain" ]]; then
+                echo "hy2://$hy2_password@$hy2_domain:$hy2_port#Hysteria2"
+            else
+                echo "hy2://$hy2_password@$server_ip:$hy2_port/?insecure=1#Hysteria2"
+            fi
+            return 0
+            ;;
+        "socks")
+            local socks_user socks_pass socks_port
+            socks_user=$(echo "$inbound_json" | jq -r '.users[0].username // ""')
+            socks_pass=$(echo "$inbound_json" | jq -r '.users[0].password // ""')
+            socks_port=$(echo "$inbound_json" | jq -r '.listen_port // "1080"')
+            echo "socks5://$socks_user:$socks_pass@$server_ip:$socks_port"
+            return 0
+            ;;
+        "shadowsocks")
+            local ss_method ss_pass ss_port ss_credential
+            ss_method=$(echo "$inbound_json" | jq -r '.method // ""')
+            ss_pass=$(echo "$inbound_json" | jq -r '.password // ""')
+            ss_port=$(echo "$inbound_json" | jq -r '.listen_port // "8388"')
+            ss_credential=$(printf "%s" "${ss_method}:${ss_pass}" | base64 | tr -d '\n')
+            echo "ss://$ss_credential@$server_ip:$ss_port#Shadowsocks"
+            return 0
+            ;;
+        "anytls")
+            local any_user any_pass any_domain any_port
+            any_user=$(echo "$inbound_json" | jq -r '.users[0].name // ""')
+            any_pass=$(echo "$inbound_json" | jq -r '.users[0].password // ""')
+            any_domain=$(echo "$inbound_json" | jq -r '.tls.server_name // ""')
+            any_port=$(echo "$inbound_json" | jq -r '.listen_port // "16999"')
+            if [[ -n "$any_domain" ]]; then
+                echo "anytls://$any_user:$any_pass@$any_domain:$any_port#AnyTLS"
+            else
+                echo "anytls://$any_user:$any_pass@$server_ip:$any_port?insecure=1#AnyTLS"
+            fi
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# 查看协议配置（二级菜单）
+protocol_config_menu() {
+    if ! command -v jq &> /dev/null; then
+        echo -e "${RED}缺少依赖: jq${NC}"
+        return
     fi
+    if [[ ! -f "$CONFIG_FILE" ]] || ! jq empty "$CONFIG_FILE" > /dev/null 2>&1; then
+        echo -e "${YELLOW}未检测到有效配置${NC}"
+        return
+    fi
+
+    while true; do
+        local protocols=()
+        local display_protocols=()
+        mapfile -t protocols < <(jq -r '.inbounds[]? | "\(.tag)|\(.type)|\(.listen_port // "N/A")|\(.tls.reality.enabled // false)"' "$CONFIG_FILE")
+
+        clear
+        echo -e "${CYAN}查看协议配置${NC}"
+        echo "  已安装协议配置"
+        echo "─────────────────────────────────────────────"
+        echo "  Xray 协议 (vless-reality 服务):"
+
+        local idx=1
+        local shown=0
+        local row tag type port reality_enabled name
+        for row in "${protocols[@]}"; do
+            IFS='|' read -r tag type port reality_enabled <<< "$row"
+            if [[ "$type" == "vless" ]]; then
+                name=$(get_protocol_display_name "$type" "$reality_enabled")
+                echo "    ${idx}) ${name} - 端口: ${port}"
+                display_protocols+=("$row")
+                shown=1
+                idx=$((idx + 1))
+            fi
+        done
+
+        for row in "${protocols[@]}"; do
+            IFS='|' read -r tag type port reality_enabled <<< "$row"
+            if [[ "$type" != "vless" ]]; then
+                name=$(get_protocol_display_name "$type" "$reality_enabled")
+                echo "    ${idx}) ${name} - 端口: ${port}"
+                display_protocols+=("$row")
+                shown=1
+                idx=$((idx + 1))
+            fi
+        done
+
+        if [[ $shown -eq 0 ]]; then
+            echo "    暂无已安装协议"
+        fi
+
+        echo
+        echo "─────────────────────────────────────────────"
+        echo "  输入序号查看详细配置/链接/二维码"
+        echo "  a) 一键展示所有分享链接"
+        echo "  0) 返回"
+        echo "─────────────────────────────────────────────"
+        read -p "  请选择 [0-$((idx-1))/a]: " sub_choice
+
+        if [[ "$sub_choice" == "0" ]]; then
+            return
+        elif [[ "$sub_choice" == "a" || "$sub_choice" == "A" ]]; then
+            echo
+            show_config
+            echo
+            read -p "按回车键继续..." -r
+        elif [[ "$sub_choice" =~ ^[0-9]+$ ]] && (( sub_choice >= 1 && sub_choice < idx )); then
+            local selected_row selected_tag selected_type selected_port selected_reality link
+            selected_row="${display_protocols[$((sub_choice - 1))]}"
+            IFS='|' read -r selected_tag selected_type selected_port selected_reality <<< "$selected_row"
+            name=$(get_protocol_display_name "$selected_type" "$selected_reality")
+            echo
+            echo "协议名称: $name"
+            echo "监听端口: $selected_port"
+            echo "协议标签: $selected_tag"
+            link=$(get_share_link_by_tag "$selected_tag" || true)
+            if [[ -n "$link" ]]; then
+                echo "分享链接: $link"
+                if command -v qrencode &> /dev/null; then
+                    echo "二维码:"
+                    qrencode -t UTF8 "$link"
+                else
+                    echo "二维码: 未安装 qrencode，暂不显示"
+                fi
+            else
+                echo "分享链接: 暂无法生成"
+            fi
+            echo
+            read -p "按回车键继续..." -r
+        else
+            echo -e "${RED}无效选择${NC}"
+            sleep 1
+        fi
+    done
+}
+
+# 卸载指定协议（二级菜单）
+uninstall_protocol_menu() {
+    if ! command -v jq &> /dev/null; then
+        echo -e "${RED}缺少依赖: jq${NC}"
+        return
+    fi
+    if [[ ! -f "$CONFIG_FILE" ]] || ! jq empty "$CONFIG_FILE" > /dev/null 2>&1; then
+        echo -e "${YELLOW}未检测到有效配置${NC}"
+        return
+    fi
+
+    while true; do
+        local protocols=()
+        mapfile -t protocols < <(jq -r '.inbounds[]? | "\(.tag)|\(.type)|\(.listen_port // "N/A")|\(.tls.reality.enabled // false)"' "$CONFIG_FILE")
+
+        clear
+        echo -e "${CYAN}卸载指定协议${NC}"
+        echo "  卸载指定协议"
+        echo "─────────────────────────────────────────────"
+        echo "  已安装的协议:"
+
+        if [[ ${#protocols[@]} -eq 0 ]]; then
+            echo "    暂无已安装协议"
+            echo
+            echo "  0) 返回"
+            echo "─────────────────────────────────────────────"
+            read -p "  选择要卸载的协议 [0]: " choice
+            return
+        fi
+
+        local i=1 row tag type port reality_enabled name
+        for row in "${protocols[@]}"; do
+            IFS='|' read -r tag type port reality_enabled <<< "$row"
+            name=$(get_protocol_display_name "$type" "$reality_enabled")
+            echo "    ${i}) ${name}"
+            i=$((i + 1))
+        done
+
+        echo
+        echo "  0) 返回"
+        echo "─────────────────────────────────────────────"
+        read -p "  选择要卸载的协议 [0-$((i-1))]: " choice
+
+        if [[ "$choice" == "0" ]]; then
+            return
+        fi
+
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < i )); then
+            local selected_tag selected_name tmp_file remaining
+            row=$(printf "%s\n" "${protocols[@]}" | sed -n "${choice}p")
+            IFS='|' read -r selected_tag type port reality_enabled <<< "$row"
+            selected_name=$(get_protocol_display_name "$type" "$reality_enabled")
+
+            read -p "确认卸载 ${selected_name}? (y/n): " confirm
+            if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+                continue
+            fi
+
+            tmp_file=$(mktemp)
+            jq --arg tag "$selected_tag" '.inbounds = [ .inbounds[]? | select(.tag != $tag) ]' "$CONFIG_FILE" > "$tmp_file"
+            mv "$tmp_file" "$CONFIG_FILE"
+
+            remaining=$(jq -r '.inbounds | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+            if [[ "$remaining" -eq 0 ]]; then
+                systemctl stop sing-box 2>/dev/null || true
+                echo -e "${GREEN}已卸载 ${selected_name}，当前无协议，服务已停止${NC}"
+            else
+                apply_service_changes
+                echo -e "${GREEN}已卸载 ${selected_name}${NC}"
+            fi
+            echo
+            read -p "按回车键继续..." -r
+        else
+            echo -e "${RED}无效选择${NC}"
+            sleep 1
+        fi
+    done
 }
 
 # 启动服务
@@ -797,6 +1094,118 @@ get_service_status() {
     fi
 }
 
+# 获取系统信息
+get_system_info() {
+    local os_name="unknown"
+    local os_version="unknown"
+    local kernel_version
+    
+    if [[ -f /etc/os-release ]]; then
+        os_name=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+        os_version=$(grep '^VERSION_ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+    fi
+    
+    kernel_version=$(uname -r 2>/dev/null || echo "unknown")
+    echo "${os_name} ${os_version} | ${kernel_version}"
+}
+
+# 获取核心版本
+get_core_version() {
+    if [[ ! -x "$BINARY_PATH" ]]; then
+        echo "Sing-box 未安装"
+        return
+    fi
+    
+    local version
+    version=$("$BINARY_PATH" version 2>/dev/null | head -1 | awk '{print $NF}')
+    if [[ -n "$version" ]]; then
+        echo "Sing-box ${version}"
+    else
+        echo "Sing-box 未知版本"
+    fi
+}
+
+# 确保运行环境可用
+ensure_sing_box_ready() {
+    install_dependencies
+    if [[ -x "$BINARY_PATH" ]]; then
+        echo -e "${GREEN}检测到已安装sing-box，跳过重复安装${NC}"
+    else
+        install_sing_box
+    fi
+}
+
+# 显示服务端管理信息
+show_server_management() {
+    local status status_text status_color protocol_count
+    local system_info core_info
+    
+    system_info=$(get_system_info)
+    core_info=$(get_core_version)
+    status=$(get_service_status)
+    
+    case $status in
+        "运行中")
+            status_text="● 运行中"
+            status_color="$GREEN"
+            ;;
+        "已停止")
+            status_text="● 已停止"
+            status_color="$YELLOW"
+            ;;
+        *)
+            status_text="● 未安装"
+            status_color="$RED"
+            ;;
+    esac
+    
+    echo -e "${CYAN}服务端管理${NC}"
+    echo "  系统: ${system_info}"
+    echo "  核心: ${core_info}"
+    echo
+    echo -e "  状态: ${status_color}${status_text}${NC}"
+    
+    protocol_count=0
+    if [[ -f "$CONFIG_FILE" ]] && command -v jq &> /dev/null; then
+        protocol_count=$(jq -r '.inbounds | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+    fi
+    
+    if [[ "$protocol_count" =~ ^[0-9]+$ ]] && [[ "$protocol_count" -gt 0 ]]; then
+        echo "  协议: 已安装 (${protocol_count}个)"
+        while IFS='|' read -r type port reality_enabled; do
+            local protocol_name
+            case "$type" in
+                "vless")
+                    if [[ "$reality_enabled" == "true" ]]; then
+                        protocol_name="VLESS+Reality"
+                    else
+                        protocol_name="VLESS"
+                    fi
+                    ;;
+                "hysteria2")
+                    protocol_name="Hysteria2"
+                    ;;
+                "shadowsocks")
+                    protocol_name="Shadowsocks"
+                    ;;
+                "socks")
+                    protocol_name="SOCKS5"
+                    ;;
+                "anytls")
+                    protocol_name="AnyTLS"
+                    ;;
+                *)
+                    protocol_name=$(echo "$type" | tr '[:lower:]' '[:upper:]')
+                    ;;
+            esac
+            echo "    • ${protocol_name} (${port})"
+        done < <(jq -r '.inbounds[]? | "\(.type)|\(.listen_port // "N/A")|\(.tls.reality.enabled // false)"' "$CONFIG_FILE" 2>/dev/null)
+    else
+        echo "  协议: 未安装"
+    fi
+    
+}
+
 # 显示菜单
 show_menu() {
     clear
@@ -806,30 +1215,22 @@ show_menu() {
     echo
     echo -e "${GREEN}1.${NC} 搭建 VLESS Reality XTLS RPRX Vision"
     echo -e "${GREEN}2.${NC} 搭建 Hysteria2"
-    echo -e "${GREEN}3.${NC} 搭建混合协议 (VLESS+Hysteria2)"
-    echo -e "${GREEN}4.${NC} 查看已安装协议和节点配置"
-    echo -e "${BLUE}5.${NC} 启动后端"
-    echo -e "${BLUE}6.${NC} 关闭后端"
-    echo -e "${BLUE}7.${NC} 重启后端"
-    echo -e "${BLUE}8.${NC} 查看后端状态"
-    echo -e "${BLUE}9.${NC} 查看服务日志"
-    echo -e "${YELLOW}10.${NC} 设置开机自启动"
-    echo -e "${YELLOW}11.${NC} 关闭开机自启动"
-    echo -e "${RED}12.${NC} 卸载"
+    echo -e "${GREEN}3.${NC} 搭建 SOCKS5"
+    echo -e "${GREEN}4.${NC} 搭建 Shadowsocks"
+    echo -e "${GREEN}5.${NC} 搭建 AnyTLS"
+    echo -e "${GREEN}6.${NC} 查看协议配置"
+    echo -e "${GREEN}7.${NC} 卸载指定协议"
+    echo -e "${BLUE}8.${NC} 启动后端"
+    echo -e "${BLUE}9.${NC} 关闭后端"
+    echo -e "${BLUE}10.${NC} 重启后端"
+    echo -e "${BLUE}11.${NC} 查看后端状态"
+    echo -e "${BLUE}12.${NC} 查看服务日志"
+    echo -e "${YELLOW}13.${NC} 设置开机自启动"
+    echo -e "${YELLOW}14.${NC} 关闭开机自启动"
+    echo -e "${RED}15.${NC} 卸载"
     echo -e "${PURPLE}0.${NC} 退出"
     echo
-    status=$(get_service_status)
-    case $status in
-        "未安装")
-            echo -e "${RED}状态: $status${NC}"
-            ;;
-        "运行中")
-            echo -e "${GREEN}状态: $status${NC}"
-            ;;
-        "已停止")
-            echo -e "${YELLOW}状态: $status${NC}"
-            ;;
-    esac
+    show_server_management
     echo
 }
 
@@ -839,49 +1240,57 @@ main() {
     
     while true; do
         show_menu
-        read -p "请选择操作 [0-12]: " choice
+        read -p "请选择操作 [0-15]: " choice
         
         case $choice in
             1)
-                install_dependencies
-                install_sing_box
+                ensure_sing_box_ready
                 install_vless_reality
                 ;;
             2)
-                install_dependencies
-                install_sing_box
+                ensure_sing_box_ready
                 install_hysteria2
                 ;;
             3)
-                install_dependencies
-                install_sing_box
-                install_mixed_protocols
+                ensure_sing_box_ready
+                install_socks5
                 ;;
             4)
-                show_config
+                ensure_sing_box_ready
+                install_shadowsocks
                 ;;
             5)
-                start_service
+                ensure_sing_box_ready
+                install_anytls
                 ;;
             6)
-                stop_service
+                protocol_config_menu
                 ;;
             7)
-                restart_service
+                uninstall_protocol_menu
                 ;;
             8)
-                show_status
+                start_service
                 ;;
             9)
-                show_logs
+                stop_service
                 ;;
             10)
-                enable_auto_start
+                restart_service
                 ;;
             11)
-                disable_auto_start
+                show_status
                 ;;
             12)
+                show_logs
+                ;;
+            13)
+                enable_auto_start
+                ;;
+            14)
+                disable_auto_start
+                ;;
+            15)
                 uninstall
                 ;;
             0)
