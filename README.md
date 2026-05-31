@@ -4,7 +4,7 @@
 
 ## 🌟 功能特性88
 
-- **多协议支持**：VLESS Reality XTLS RPRX Vision、Hysteria2
+- **多协议支持**：VLESS Reality XTLS RPRX Vision、Hysteria22919799123
 - **自定义端口**：支持为每个协议自定义端口号
 - **混合模式**：同时运行多个协议
 - **自动安装**：一键安装 sing-box 最新版本
