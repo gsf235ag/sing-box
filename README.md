@@ -2,7 +2,7 @@
 
 一个功能强大的 sing-box 服务器端管理脚本，支持 VLESS Reality 和 Hysteria2 协议，提供完整的服务管理功能。
 
-## 🌟 功能特性
+## 🌟 功能特性88
 
 - **多协议支持**：VLESS Reality XTLS RPRX Vision、Hysteria2
 - **自定义端口**：支持为每个协议自定义端口号
